@@ -25,15 +25,22 @@ export class GameService {
 
   constructor() {
     const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
+    console.log(`[SERVICE] Redis Bağlanıyor... URL: ${process.env.REDIS_URL ? 'ENV Var (Render)' : 'Localhost'}`);
+
     if (process.env.REDIS_URL) {
       this.redis = new Redis(redisUrl);
     } else {
       this.redis = new Redis({ host: 'localhost', port: 6379 });
     }
+
+    // REDIS BAĞLANTI DURUMU LOGLARI
+    this.redis.on('connect', () => console.log('[SERVICE] Redis Başarıyla Bağlandı! 🟢'));
+    this.redis.on('error', (err) => console.error('[SERVICE] Redis Hatası! 🔴', err));
   }
 
   // --- RECONNECTION (Yeniden Bağlanma) ---
   async handleConnection(playerId: string): Promise<any> {
+    console.log(`[SERVICE] handleConnection: ${playerId} kontrol ediliyor...`);
     const activeGameId = await this.redis.get(`player:${playerId}:game`);
 
     if (activeGameId) {
@@ -41,7 +48,8 @@ export class GameService {
       if (rawGame) {
         const gameState = JSON.parse(rawGame);
         this.calculateCurrentTime(gameState);
-
+        
+        console.log(`[SERVICE] ${playerId} eski oyununa döndü: ${activeGameId}`);
         return {
           status: 'reconnected',
           gameId: activeGameId,
@@ -53,17 +61,19 @@ export class GameService {
         };
       }
     }
+    console.log(`[SERVICE] ${playerId} için aktif oyun yok. Lobiye yönlendiriliyor.`);
     return { status: 'lobby' };
   }
 
-
   async removeActiveGame(playerId: string) {
+    console.log(`[SERVICE] removeActiveGame: ${playerId} kaydı siliniyor.`);
     await this.redis.del(`player:${playerId}:game`);
   }
 
   async leaveGame(playerId: string) {
     const activeGameId = await this.redis.get(`player:${playerId}:game`);
     if (activeGameId) {
+      console.log(`[SERVICE] leaveGame: ${playerId} oyundan ayrıldı.`);
       await this.redis.del(`player:${playerId}:game`);
       return { success: true };
     }
@@ -72,6 +82,7 @@ export class GameService {
 
   // --- PES ETME (Resign) ---
   async resignGame(playerId: string): Promise<any> {
+    console.log(`[SERVICE] resignGame: ${playerId} pes ediyor.`);
     const activeGameId = await this.redis.get(`player:${playerId}:game`);
     if (!activeGameId) return null;
 
@@ -96,6 +107,7 @@ export class GameService {
 
   // --- OYUN BULMA (Kuyruk) ---
   async joinQueue(playerId: string, timeControl: string): Promise<any> {
+    console.log(`[SERVICE] joinQueue: ${playerId}, Süre: ${timeControl}dk`);
     this.removeFromQueues(playerId);
 
     const queue = this.queues[timeControl];
@@ -110,9 +122,11 @@ export class GameService {
         return { status: 'waiting' };
       }
 
+      console.log(`[SERVICE] Eşleşme bulundu! ${playerId} vs ${opponentId}`);
       return await this.createGame(opponentId, playerId, timeControl);
     } else {
       queue.push(playerId);
+      console.log(`[SERVICE] ${playerId} kuyruğa eklendi. Bekleniyor...`);
       return { status: 'waiting' };
     }
   }
@@ -121,6 +135,7 @@ export class GameService {
   async createPrivateRoom(playerId: string): Promise<string> {
     const roomId = Math.random().toString(36).substring(2, 8).toUpperCase();
     await this.redis.set(`room:${roomId}`, playerId, 'EX', 600);
+    console.log(`[SERVICE] Özel oda kuruldu: ${roomId} (Kurucu: ${playerId})`);
     return roomId;
   }
 
@@ -129,6 +144,7 @@ export class GameService {
     if (!creatorId) return { error: 'Oda bulunamadı.' };
     if (creatorId === playerId) return { error: 'Kendi odana giremezsin.' };
 
+    console.log(`[SERVICE] Özel odaya giriş: ${playerId} -> ${roomId}`);
     await this.redis.del(`room:${roomId}`);
     return await this.createGame(creatorId, playerId, '10');
   }
@@ -136,6 +152,8 @@ export class GameService {
   // --- OYUN OLUŞTURMA ---
   private async createGame(whiteId: string, blackId: string, timeControlStr: string) {
     const gameId = uuidv4();
+    console.log(`[SERVICE] OYUN OLUŞTURULDU: ${gameId} (Tip: ${timeControlStr})`);
+    
     const fen = new Chess().fen();
     
     // Bot oyunuysa (içinde : varsa) veya süre 0 gelirse varsayılan 10dk ver
@@ -156,7 +174,6 @@ export class GameService {
     await this.redis.set(`game:${gameId}`, JSON.stringify(gameState), 'EX', 3600 * 24);
     await this.redis.set(`player:${whiteId}:game`, gameId, 'EX', 3600 * 24);
     
-    
     if (blackId !== 'BOT_PLAYER') {
         await this.redis.set(`player:${blackId}:game`, gameId, 'EX', 3600 * 24);
     }
@@ -175,6 +192,7 @@ export class GameService {
   // --- BOT OYUNU BAŞLATMA ---
   async createBotGame(playerId: string, difficulty: 'easy' | 'medium' | 'hard') {
     const botId = "BOT_PLAYER";
+    console.log(`[SERVICE] Bot oyunu isteniyor: ${playerId} vs BOT (${difficulty})`);
     return await this.createGame(playerId, botId, `bot:${difficulty}`);
   }
 
@@ -205,6 +223,7 @@ export class GameService {
       gameState.lastMoveTimestamp = Date.now();
 
       await this.redis.set(`game:${gameId}`, JSON.stringify(gameState), 'EX', 3600 * 24);
+      console.log(`[SERVICE] Hamle işlendi: ${playerId} -> ${move.from}-${move.to}`);
 
       return {
         fen: gameState.fen,
@@ -217,6 +236,7 @@ export class GameService {
         blackTime: gameState.blackTime
       };
     } catch (e) {
+      console.error(`[SERVICE] Geçersiz hamle denemesi: ${e.message}`);
       throw new Error('Geçersiz hamle');
     }
   }
@@ -229,10 +249,12 @@ export class GameService {
     const gameState = JSON.parse(rawGame);
     const chess = new Chess(gameState.fen);
     
-    
+    // Sadece bot sırasıysa ve oyun bitmediyse
     if (gameState.black !== 'BOT_PLAYER' || chess.turn() !== 'b' || chess.isGameOver()) return null;
 
     const difficulty = gameState.type.split(':')[1] || 'easy';
+    console.log(`[SERVICE-BOT] Bot düşünüyor... (Zorluk: ${difficulty})`);
+
     let chosenMove;
 
     if (difficulty === 'easy') {
@@ -245,7 +267,10 @@ export class GameService {
         chosenMove = this.getBestMove(chess, depth);
     }
 
-    if (!chosenMove) return null;
+    if (!chosenMove) {
+        console.log(`[SERVICE-BOT] Bot hamle bulamadı!`);
+        return null;
+    }
 
     chess.move(chosenMove);
     gameState.fen = chess.fen();
@@ -253,6 +278,8 @@ export class GameService {
     gameState.lastMoveTimestamp = Date.now();
     
     await this.redis.set(`game:${gameId}`, JSON.stringify(gameState), 'EX', 3600 * 24);
+    
+    console.log(`[SERVICE-BOT] Bot oynadı: ${chosenMove.from}->${chosenMove.to}`);
 
     return {
         fen: gameState.fen,
@@ -269,7 +296,7 @@ export class GameService {
   private getBestMove(chess: Chess, depth: number) {
     const moves = chess.moves({ verbose: true });
     
-    
+    // DÜZELTME: any tipi ile değişkeni dışarıda tanımlıyoruz
     let bestMove: any = null; 
     let bestValue = -Infinity;
 
@@ -277,13 +304,12 @@ export class GameService {
 
     for (const move of moves) {
         chess.move(move);
-        
         const boardValue = this.minimax(chess, depth - 1, -Infinity, Infinity, false);
         chess.undo(); 
 
         if (boardValue > bestValue) {
             bestValue = boardValue;
-            bestMove = move;
+            bestMove = move; // Düzeltme: Dışarıdaki değişkeni güncelliyoruz
         }
     }
     return bestMove || moves[0];
