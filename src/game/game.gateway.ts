@@ -12,11 +12,11 @@ import { GameService } from './game.service';
 
 @WebSocketGateway({
   cors: {
-    origin: '*', 
+    origin: '*',
     methods: ['GET', 'POST'],
     credentials: true
   },
-  transports: ['websocket', 'polling'], 
+  transports: ['websocket', 'polling'],
 })
 export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
   @WebSocketServer()
@@ -24,54 +24,147 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
   constructor(private readonly gameService: GameService) {}
 
+  
+  async handleConnection(client: Socket) {
+    const playerId = client.handshake.query.playerId as string;
 
-async handleConnection(client: Socket) {
-    const result = await this.gameService.handleConnection(client.id);
-
-    if (result.status === 'waiting') {
-      client.emit('status', 'Rakip aranıyor...');
-    } else {
-      const { gameId, whitePlayer, blackPlayer, fen } = result;
-
-      const whiteSocket = this.server.sockets.sockets.get(whitePlayer);
-      const blackSocket = this.server.sockets.sockets.get(blackPlayer);
-
-      if (whiteSocket) whiteSocket.join(gameId);
-      if (blackSocket) blackSocket.join(gameId);
-
-      if (whiteSocket) whiteSocket.emit('gameStart', { gameId, color: 'w', fen });
-      
-      // Siyaha: Sen Siyah'sın
-      if (blackSocket) blackSocket.emit('gameStart', { gameId, color: 'b', fen });
-      
-      console.log(`Oyun başladı: ${gameId}`);
+    if (!playerId) {
+      client.disconnect();
+      return;
     }
-}
+
+    client.join(playerId);
+
+    const result = await this.gameService.handleConnection(playerId);
+
+    if (result.status === 'reconnected') {
+      client.join(result.gameId);
+      client.emit('reconnectGame', result);
+    } else {
+      client.emit('lobbyStatus', 'Lobiye Hoşgeldin');
+    }
+  }
 
   handleDisconnect(client: Socket) {
-    console.log(`Biri kaçtı: ${client.id}`);
+    const playerId = client.handshake.query.playerId as string;
+    if (playerId) this.gameService.removeFromQueues(playerId);
+  }
+
+  // 1. KUYRUĞA GİR
+  @SubscribeMessage('joinQueue')
+  async handleJoinQueue(@ConnectedSocket() client: Socket, @MessageBody() data: { time: string }) {
+    const playerId = client.handshake.query.playerId as string;
+    const result = await this.gameService.joinQueue(playerId, data.time);
+
+    if (result.status === 'waiting') {
+      client.emit('status', `${data.time}dk modu için rakip aranıyor...`);
+    } else if (result.status === 'started') {
+      this.startGame(result);
+    }
+  }
+
+  // 2. ÖZEL ODA KUR
+  @SubscribeMessage('createRoom')
+  async handleCreateRoom(@ConnectedSocket() client: Socket) {
+    const playerId = client.handshake.query.playerId as string;
+    const roomId = await this.gameService.createPrivateRoom(playerId);
+    client.emit('roomCreated', roomId);
+    client.emit('status', `Oda Kodu: ${roomId}. Arkadaşını bekle...`);
+  }
+
+  // 3. ÖZEL ODAYA GİR
+  @SubscribeMessage('joinRoom')
+  async handleJoinRoom(@ConnectedSocket() client: Socket, @MessageBody() data: { roomId: string }) {
+    const playerId = client.handshake.query.playerId as string;
+    const result = await this.gameService.joinPrivateRoom(playerId, data.roomId);
+
+    if (result.error) {
+      client.emit('error', result.error);
+    } else {
+      this.startGame(result);
+    }
+  }
+
+  // 4. HAMLE
+  @SubscribeMessage('makeMove')
+  async handleMove(@ConnectedSocket() client: Socket, @MessageBody() data: any) {
+    const playerId = client.handshake.query.playerId as string;
+    try {
+      
+      const update = await this.gameService.makeMove(data.gameId, playerId, data.move);
+      this.server.to(data.gameId).emit('updateBoard', update);
+
+     
+      setTimeout(async () => {
+        const botUpdate = await this.gameService.makeSmartBotMove(data.gameId);
+        if (botUpdate) {
+          this.server.to(data.gameId).emit('updateBoard', botUpdate);
+        }
+      }, 500); 
+
+    } catch (e) {
+      client.emit('error', e.message);
+    }
+  }
+
+  // 5. BOT İLE OYNA
+  @SubscribeMessage('playVsBot')
+async handlePlayVsBot(@ConnectedSocket() client: Socket, @MessageBody() data: { difficulty: string }) {
+    const playerId = client.handshake.query.playerId as string;
     
+    const difficulty = (data && data.difficulty) ? data.difficulty : 'easy';
+    
+    const result = await this.gameService.createBotGame(playerId, difficulty as any);
+    this.startGame(result);
+}
+
+  // 6. PES ET
+  @SubscribeMessage('resign')
+  async handleResign(@ConnectedSocket() client: Socket) {
+    const playerId = client.handshake.query.playerId as string;
+    const result = await this.gameService.resignGame(playerId);
+
+    if (result) {
+      this.server.to(result.gameId).emit('updateBoard', result);
+    }
+  }
+
+  // 7. MENÜYE DÖN
+  @SubscribeMessage('backToMenu')
+  async handleBackToMenu(@ConnectedSocket() client: Socket) {
+    const playerId = client.handshake.query.playerId as string;
+    await this.gameService.removeActiveGame(playerId);
+    client.emit('returnedToMenu');
   }
 
   
-  @SubscribeMessage('makeMove')
-  async handleMove(
-    @ConnectedSocket() client: Socket,
-    @MessageBody() data: { gameId: string; from: string; to: string },
-  ) {
-    try {
-      
-      const gameUpdate = await this.gameService.makeMove(data.gameId, {
-        from: data.from,
-        to: data.to,
-      });
+  private startGame(data: any) {
+    const { gameId, whitePlayer, blackPlayer, fen, whiteTime, blackTime } = data;
 
-     
-      this.server.to(data.gameId).emit('updateBoard', gameUpdate);
+    
+    this.server.to(whitePlayer).emit('gameStart', {
+      gameId,
+      color: 'w',
+      fen,
+      whiteTime,
+      blackTime
+    });
+    
+    // Beyazı odaya sok
+    this.server.in(whitePlayer).socketsJoin(gameId);
 
-    } catch (error) {
-      
-      client.emit('error', error.message);
+    
+    if (blackPlayer !== 'BOT_PLAYER') {
+        this.server.to(blackPlayer).emit('gameStart', {
+            gameId,
+            color: 'b',
+            fen,
+            whiteTime,
+            blackTime
+        });
+        
+        // Siyahı odaya sok
+        this.server.in(blackPlayer).socketsJoin(gameId);
     }
-  }
+  }
 }
